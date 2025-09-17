@@ -2,12 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 Stereo YOLOv8n-Seg (first 10 frames merged) + MediaPipe-on-Left → Live overlay (mm)
-+ Laser-origin yaw/pitch per hold (LEFT-camera-based) + auto-target ID0 (absolute command)
++ Laser-origin yaw/pitch per hold (LEFT-camera-based)
++ ✅ DualServoController 연동: 초기 각도는 CLI로 1회만 설정, 이후 손가락이 잡으면 다음 홀드로 자동 이동
 
 - 시작 시 첫 10프레임에서 YOLO 세그 → 프레임 간 중복 병합 → y행/x정렬로 hold_index 부여
-- 좌/우 공통 hold_index 쌍만 삼각측량 → X(mm), |X−L|, d_line, yaw/pitch(레이저 원점=LEFT기준) 계산
-- 시작 시: ID 0(없으면 가장 작은 ID) 자동 선택 → 명령 각 산출(보정 반영) → (옵션) 시리얼 송신
-- 라이브: 레티파이 프레임을 화면에 표시할 때 좌/우 스왑 옵션(SWAP_DISPLAY)으로 UI 정렬
+- 좌/우 공통 hold_index 쌍만 삼각측량 → X(mm), yaw/pitch(레이저 원점=LEFT기준) 계산
+- 시작 시: (옵션) --center 또는 --pitch/--yaw 로 1회만 수동 초기세팅
+- 라이브: MediaPipe로 '현재 타깃 홀드'에 손가락이 TOUCH_THRESHOLD 프레임 이상 들어오면 다음 홀드로 자동 이동
 - 저장: grip_records.csv 만 저장
 """
 
@@ -19,9 +20,27 @@ from ultralytics import YOLO
 import mediapipe as mp
 import csv
 import math
+import argparse
+
+# ======== (NEW) DualServoController 가져오기 ========
+# - servo_control.py의 직렬 명령 형식을 그대로 사용
+# - 없으면 더미 컨트롤러로 안전 동작
+try:
+    from servo_control import DualServoController  # S pitch yaw / P / Y / C / R / Z
+    HAS_SERVO = True
+except Exception:
+    HAS_SERVO = False
+    class DualServoController:
+        def __init__(self, *a, **k): print("[Servo] (stub) controller unavailable")
+        def set_angles(self, pitch=None, yaw=None): print(f"[Servo] (stub) set_angles: P={pitch}, Y={yaw}")
+        def center(self): print("[Servo] (stub) center")
+        def query(self): print("[Servo] (stub) query"); return ""
+        def laser_on(self): print("[Servo] (stub) laser_on")
+        def laser_off(self): print("[Servo] (stub) laser_off")
+        def close(self): pass
 
 # ========= 사용자 설정 =========
-NPZ_PATH       = r"C:\Users\user\Documents\캡스턴 디자인\triangulation\calib_out\20250915_104820\stereo\stereo_params_scaled.npz"
+NPZ_PATH       = r"C:\Users\user\Documents\캡스턴 디자인\triangulation\calib_out\old_camera_same\stereo\stereo_params_scaled.npz"
 MODEL_PATH     = r"C:\Users\user\Documents\캡스턴 디자인\triangulation\best_6.pt"
 
 CAM1_INDEX     = 1   # 물리 카메라 인덱스(왼쪽)
@@ -31,9 +50,9 @@ CAM2_INDEX     = 2   # 물리 카메라 인덱스(오른쪽)
 SWAP_INPUT     = False
 
 # 화면(UI)만 좌/우 바꿔서 표시할지 (오버레이/텍스트 오프셋 자동 정합)
-SWAP_DISPLAY   = True
+SWAP_DISPLAY   = False
 
-WINDOW_NAME    = "Rectified L | R  (10f merged, LEFT-origin O; MP Left, Auto-ID0)"
+WINDOW_NAME    = "Rectified L | R  (10f merged; MP Left; Servo Auto-Advance)"
 SHOW_GRID      = False
 THRESH_MASK    = 0.7
 ROW_TOL_Y      = 30
@@ -43,28 +62,15 @@ SAVE_VIDEO     = False
 OUT_FPS        = 30
 OUT_PATH       = "stereo_overlay.mp4"
 
-CSV_GRIPS_PATH  = "grip_records.csv"   # ✅ 그립 기록만 저장
-TOUCH_THRESHOLD = 10                   # 연속 프레임 수(>= 이면 채색)
+CSV_GRIPS_PATH  = "grip_records.csv"
+TOUCH_THRESHOLD = 10  # 연속 프레임
+# =================================
 
 # ---- 레이저 원점(=조준 기준점) 오프셋 (LEFT 카메라 원점 기준, cm) ----
-# 실측: 왼쪽 카메라 중심 기준 왼쪽 1.85cm, 위 8cm, 카메라보다 3.3cm 뒤
-LASER_OFFSET_CM_LEFT = 1.85   # '왼쪽'은 x 음(-) 처리
-LASER_OFFSET_CM_UP   = 8.0    # '위쪽'은 y 음(-) 처리
-LASER_OFFSET_CM_FWD  = -3.3   # 전방 +, 뒤쪽 - → 뒤 3.3cm 이므로 -3.3
+LASER_OFFSET_CM_LEFT = 1.85   # '왼쪽'은 x 음(-)
+LASER_OFFSET_CM_UP   = 8.0    # '위쪽'은 y 음(-)
+LASER_OFFSET_CM_FWD  = -3.3   # 전방 +, 뒤쪽 - → 뒤 3.3cm이므로 -3.3
 Y_UP_IS_NEGATIVE = True       # 위가 -y
-
-# ---- “ID0로 조준”을 실제로 보낼지 옵션 ----
-SEND_SERIAL      = False           # True로 바꾸면 시리얼 송신
-SERIAL_PORT      = "COM5"  # 사용자 환경에 맞게 변경          # 보드 포트
-SERIAL_BAUD      = 115200
-
-# ---- 순차 구동 옵션 (홀드 idx 오름차순으로 이동) ----
-DRIVE_SEQUENCE_ON_START = True     # True면 초기 매칭 후 연속으로 모두 조준
-SEQ_ORDER_ASC           = True     # True: 0->1->2..., False: 큰 idx->작은 idx
-SEQ_DWELL_SEC           = 0.35     # 각 타겟에서 잠깐 머무는 시간
-SEQ_STEP_DEG            = 3.0      # 램핑용 스텝 크기(도). 0 or None이면 램핑 없이 바로 점프
-SEQ_STEP_DELAY_SEC      = 0.02     # 스텝 사이 대기
-
 
 # 간단 오프셋 보정(현장 튜닝)
 YAW_OFFSET_DEG   = 0.0
@@ -75,18 +81,12 @@ USE_LINEAR_CAL = False
 A11, A12, B1 = 1.0, 0.0, 0.0    # yaw_cmd = A11*yaw_est + A12*pitch_est + B1
 A21, A22, B2 = 0.0, 1.0, 0.0    # pitch_cmd = A21*yaw_est + A22*pitch_est + B2
 
-# (선택) 서보 각→PWM(us) 맵 — 하드웨어에 맞게 수정
-SERVO = {
-    "YAW_MIN_DEG":   -90.0, "YAW_MAX_DEG":   90.0, "YAW_MIN_US": 1000, "YAW_MAX_US": 2000,
-    "PITCH_MIN_DEG": -45.0, "PITCH_MAX_DEG": 45.0, "PITCH_MIN_US":1000, "PITCH_MAX_US":2000,
-}
-
 # (선택) 프리뷰 최대 폭
 PREVIEW_MAX_W = None  # 예: 1280
 
 # ==== 초기 YOLO 프레임 수 & 병합 기준 ====
-INIT_DET_FRAMES   = 10          # ✅ 첫 10프레임 사용
-CENTER_MERGE_PX   = 18          # ✅ 프레임 간 동일 홀드로 간주할 중심거리(px)
+INIT_DET_FRAMES   = 10
+CENTER_MERGE_PX   = 18
 # ==============================
 
 # YOLO 클래스 컬러 (BGR)
@@ -133,13 +133,8 @@ def open_cams(idx1, idx2, size):
     cap2 = cv2.VideoCapture(idx2, cv2.CAP_DSHOW)
     cap1.set(cv2.CAP_PROP_FRAME_WIDTH,  W); cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
     cap2.set(cv2.CAP_PROP_FRAME_WIDTH,  W); cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
-    if not cap1.isOpened():
-        raise SystemExit("카메라 1를 열 수 없습니다. 인덱스/연결 확인.")
-    elif not cap2.isOpened():
-        raise SystemExit("카메라 2를 열 수 없습니다. 인덱스/연결 확인.")
-    elif not cap1.isOpened() and not cap2.isOpened():
-        raise SystemExit("둘다 열 수 없습니다. 인덱스/연결 확인.")
-
+    if not cap1.isOpened() or not cap2.isOpened():
+        raise SystemExit("카메라를 열 수 없습니다. 인덱스/연결 확인.")
     return cap1, cap2
 
 def rectify(frame, mx, my, size):
@@ -155,7 +150,6 @@ def extract_holds_with_indices(frame_bgr, model, selected_class_name=None,
     holds = []
     if res.masks is None: return []
     masks = res.masks.data; boxes = res.boxes; names = model.names
-    print(f"[dbg] masks={tuple(res.masks.data.shape)} | frame={(h,w)}")
     for i in range(masks.shape[0]):
         mask = masks[i].cpu().numpy()
         mask_rs = cv2.resize(mask, (w, h), interpolation=cv2.INTER_NEAREST)
@@ -192,14 +186,13 @@ def merge_holds_by_center(holds_lists, merge_dist_px=18):
     merged = []
     for holds in holds_lists:
         for h in holds:
-            h = {k: v for k, v in h.items()}  # shallow copy
-            h.pop("hold_index", None)         # 인덱스는 최종에 재부여
+            h = {k: v for k, v in h.items()}
+            h.pop("hold_index", None)
             assigned = False
             for m in merged:
                 dx = h["center"][0] - m["center"][0]
                 dy = h["center"][1] - m["center"][1]
                 if (dx*dx + dy*dy) ** 0.5 <= merge_dist_px:
-                    # 대표 갱신 기준: 면적 우선, 비슷하면 conf 큰 것
                     area_h = cv2.contourArea(h["contour"])
                     area_m = cv2.contourArea(m["contour"])
                     if (area_h > area_m) or (abs(area_h - area_m) < 1e-6 and h.get("conf",0) > m.get("conf",0)):
@@ -263,66 +256,44 @@ def imshow_scaled(win, img, maxw=None):
         img = cv2.resize(img, (int(w*s), int(h*s)))
     cv2.imshow(win, img)
 
-def deg_to_us(angle, min_deg, max_deg, min_us, max_us):
-    angle = float(np.clip(angle, min_deg, max_deg))
-    return int(np.interp(angle, [min_deg, max_deg], [min_us, max_us]))
-
-
-def send_servo_abs_us(ser, yaw_us, pitch_us, verbose=True):
-    """Send absolute microsecond commands to yaw/pitch. Protocol: 'Y<us>', 'P<us>' per line."""
-    try:
-        ser.write(f"Y{int(yaw_us)}\n".encode()); 
-        ser.write(f"P{int(pitch_us)}\n".encode())
-        if verbose:
-            print(f"[Serial] Y={int(yaw_us)}us, P={int(pitch_us)}us")
-    except Exception as e:
-        print(f"[Serial][ERR] send failed: {e}")
-
-def ramp_servo_to_deg(ser, cur_yaw_deg, cur_pitch_deg, tgt_yaw_deg, tgt_pitch_deg, step_deg=3.0, step_delay=0.02):
-    """Linear ramp in degree space; converts each step to microseconds and sends absolute commands."""
-    if not step_deg or step_deg <= 0:
-        # Jump directly
-        yu = deg_to_us(tgt_yaw_deg,   SERVO['YAW_MIN_DEG'],   SERVO['YAW_MAX_DEG'],   SERVO['YAW_MIN_US'],   SERVO['YAW_MAX_US'])
-        pu = deg_to_us(tgt_pitch_deg, SERVO['PITCH_MIN_DEG'], SERVO['PITCH_MAX_DEG'], SERVO['PITCH_MIN_US'], SERVO['PITCH_MAX_US'])
-        send_servo_abs_us(ser, yu, pu)
-        return tgt_yaw_deg, tgt_pitch_deg
-
-    import time as _t
-    y = float(cur_yaw_deg)
-    p = float(cur_pitch_deg)
-    while True:
-        dy = tgt_yaw_deg   - y
-        dp = tgt_pitch_deg - p
-        if abs(dy) <= step_deg and abs(dp) <= step_deg:
-            y = tgt_yaw_deg; p = tgt_pitch_deg
-            yu = deg_to_us(y, SERVO['YAW_MIN_DEG'], SERVO['YAW_MAX_DEG'], SERVO['YAW_MIN_US'], SERVO['YAW_MAX_US'])
-            pu = deg_to_us(p, SERVO['PITCH_MIN_DEG'], SERVO['PITCH_MAX_DEG'], SERVO['PITCH_MIN_US'], SERVO['PITCH_MAX_US'])
-            send_servo_abs_us(ser, yu, pu, verbose=False)
-            break
-        # step toward target
-        if abs(dy) > step_deg:
-            y += step_deg if dy > 0 else -step_deg
-        else:
-            y = tgt_yaw_deg
-        if abs(dp) > step_deg:
-            p += step_deg if dp > 0 else -step_deg
-        else:
-            p = tgt_pitch_deg
-        yu = deg_to_us(y, SERVO['YAW_MIN_DEG'], SERVO['YAW_MAX_DEG'], SERVO['YAW_MIN_US'], SERVO['YAW_MAX_US'])
-        pu = deg_to_us(p, SERVO['PITCH_MIN_DEG'], SERVO['PITCH_MAX_DEG'], SERVO['PITCH_MIN_US'], SERVO['PITCH_MAX_US'])
-        send_servo_abs_us(ser, yu, pu, verbose=False)
-        _t.sleep(max(0.0, float(step_delay)))
-    print(f"[Serial][ramp] to yaw={y:.2f}°, pitch={p:.2f}°")
-    return y, p
 def xoff_for(side, W, swap):
-    # side: "L" 또는 "R" (왼쪽 카메라/오른쪽 카메라 프레임)
     if side == "L":
         return (W if swap else 0)
     else:
         return (0 if swap else W)
 
+# ---------- (NEW) Servo 보정/전송 ----------
+def apply_calibration(yaw_est, pitch_est):
+    if USE_LINEAR_CAL:
+        yaw_cmd   = A11*yaw_est + A12*pitch_est + B1
+        pitch_cmd = A21*yaw_est + A22*pitch_est + B2
+    else:
+        yaw_cmd   = yaw_est   + YAW_OFFSET_DEG
+        pitch_cmd = pitch_est + PITCH_OFFSET_DEG
+    return yaw_cmd, pitch_cmd
+
+def send_servo_angles(ctl, yaw_cmd, pitch_cmd):
+    # DualServoController는 (pitch, yaw) 순서로 전송
+    try:
+        print(f"[Servo] send: yaw={yaw_cmd:.2f}°, pitch={pitch_cmd:.2f}°")
+        ctl.set_angles(pitch_cmd, yaw_cmd)
+    except Exception as e:
+        print(f"[Servo ERROR] {e}")
+
 # ---------- 메인 ----------
 def main():
+    # ---- CLI 인자 (초기 1회 세팅만) ----
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", default="COM4", help="서보 보드 포트 (예: COM4)")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--center", action="store_true", help="시작 시 1회 센터 이동")
+    ap.add_argument("--pitch", type=float, help="시작 시 1회 수동 pitch 각도")
+    ap.add_argument("--yaw",   type=float, help="시작 시 1회 수동 yaw 각도")
+    ap.add_argument("--laser_on",  action="store_true", help="시작 시 레이저 ON")
+    ap.add_argument("--laser_off", action="store_true", help="시작 시 레이저 OFF")
+    ap.add_argument("--no_auto_advance", action="store_true", help="손 인식 자동 넘김 비활성화")
+    args = ap.parse_args()
+
     # 경로 검사
     for p in (NPZ_PATH, MODEL_PATH):
         if not Path(p).exists():
@@ -333,8 +304,8 @@ def main():
     W, H = size
     print(f"[Info] image_size={(W,H)}, baseline~{B:.2f} mm")
 
-    # 레이저 원점 O = LEFT 카메라 원점 L + (왼 1.85cm, 위 8cm, 뒤 3.3cm)
-    L = np.array([0.0, 0.0, 0.0], dtype=np.float64)  # 왼쪽 카메라가 원점
+    # 레이저 원점 O (LEFT 카메라 기준 오프셋)
+    L = np.array([0.0, 0.0, 0.0], dtype=np.float64)
     dx = -LASER_OFFSET_CM_LEFT * 10.0
     dy = (-1.0 if Y_UP_IS_NEGATIVE else 1.0) * LASER_OFFSET_CM_UP * 10.0
     dz = LASER_OFFSET_CM_FWD * 10.0
@@ -356,17 +327,15 @@ def main():
     # 카메라 & 모델
     capL_idx, capR_idx = CAM1_INDEX, CAM2_INDEX
     if SWAP_INPUT:
-        capL_idx, capR_idx = capR_idx, capL_idx  # 입력을 스왑하여 보정 좌/우와 일치
+        capL_idx, capR_idx = capR_idx, capL_idx
     cap1, cap2 = open_cams(capL_idx, capR_idx, size)
     model = YOLO(str(MODEL_PATH))
 
     # ====== 초기 10프레임 수집 & YOLO → 병합 ======
     print(f"[Init] First {INIT_DET_FRAMES} frames: YOLO seg & merge ...")
     L_sets, R_sets = [], []
-    # 워밍업 (옵션)
-    for _ in range(2):
+    for _ in range(2):  # 워밍업
         cap1.read(); cap2.read()
-
     for k in range(INIT_DET_FRAMES):
         ok1, f1 = cap1.read(); ok2, f2 = cap2.read()
         if not (ok1 and ok2):
@@ -379,16 +348,15 @@ def main():
         L_sets.append(holdsL_k); R_sets.append(holdsR_k)
         print(f"  - frame {k+1}/{INIT_DET_FRAMES}: L={len(holdsL_k)}  R={len(holdsR_k)}")
 
-    # 프레임 간 중복 병합 후 최종 인덱스 재부여
+    # 병합 후 인덱스 재부여
     holdsL = assign_indices(merge_holds_by_center(L_sets, CENTER_MERGE_PX), ROW_TOL_Y)
     holdsR = assign_indices(merge_holds_by_center(R_sets, CENTER_MERGE_PX), ROW_TOL_Y)
-
     if not holdsL or not holdsR:
         cap1.release(); cap2.release()
         print("[Warn] 한쪽 또는 양쪽에서 홀드가 검출되지 않았습니다.")
         return
 
-    # index → hold 맵 & 공통 ID
+    # 좌/우 공통 hold_index
     idxL = {h["hold_index"]: h for h in holdsL}
     idxR = {h["hold_index"]: h for h in holdsR}
     common_ids = sorted(set(idxL.keys()) & set(idxR.keys()))
@@ -397,125 +365,56 @@ def main():
     else:
         print(f"[Info] 매칭된 홀드 쌍 수: {len(common_ids)}")
 
-    # 매칭 결과 사전 계산(3D, 거리, 각도) — LEFT 원점 기반
+    # 매칭 결과(3D/각도) — LEFT 원점 기반
     matched_results = []
     for hid in common_ids:
         Lh = idxL[hid]; Rh = idxR[hid]
         X = triangulate_xy(P1, P2, Lh["center"], Rh["center"])
-        d_left  = float(np.linalg.norm(X - L))            # LEFT 기준 거리
-        d_line  = float(np.hypot(X[1], X[2]))
         yaw_deg, pitch_deg = yaw_pitch_from_X(X, O, Y_UP_IS_NEGATIVE)
         matched_results.append({
-            "hid": hid,
-            "Lcx": Lh["center"][0], "Lcy": Lh["center"][1],
-            "Rcx": Rh["center"][0], "Rcy": Rh["center"][1],
-            "color": Lh["color"],
-            "X": X, "d_left": d_left, "d_line": d_line,
+            "hid": hid, "color": Lh["color"], "X": X,
             "yaw_deg": yaw_deg, "pitch_deg": pitch_deg,
         })
-
-    # 연속 인덱스 각도차 (정보용)
     by_id = {mr["hid"]: mr for mr in matched_results}
-    max_id = max(by_id) if by_id else -1
-    angle_deltas = []
-    for i in range(max_id):
-        if (i in by_id) and (i+1 in by_id):
-            a = by_id[i]; b = by_id[i+1]
-            dyaw   = wrap_deg(b["yaw_deg"]   - a["yaw_deg"])
-            dpitch = wrap_deg(b["pitch_deg"] - a["pitch_deg"])
-            v1 = a["X"] - O; v2 = b["X"] - O
-            d3d = angle_between(v1, v2)
-            angle_deltas.append((i, i+1, dyaw, dpitch, d3d))
+    sorted_ids = sorted(by_id.keys())
 
-    print("\n[ΔAngles] (i -> i+1):  Δyaw(deg), Δpitch(deg), 3D_angle(deg)")
-    for i, j, dyaw, dpitch, d3d in angle_deltas:
-        print(f"  {i:>2}→{j:<2} :  {dyaw:+6.2f}°, {dpitch:+6.2f}°, {d3d:6.2f}°")
-
-        # ====== ⬇️ 여기서 '시작하면 0번 인덱스로 조준' 처리됨 ⬇️ ======
-    target_id = 0 if 0 in by_id else (min(by_id.keys()) if by_id else None)
-    first_target = by_id.get(target_id) if target_id is not None else None
-
-    yaw_cmd = pitch_cmd = None
-    if first_target:
-        yaw_est   = first_target["yaw_deg"]
-        pitch_est = first_target["pitch_deg"]
-
-        if USE_LINEAR_CAL:
-            yaw_cmd   = A11*yaw_est + A12*pitch_est + B1
-            pitch_cmd = A21*yaw_est + A22*pitch_est + B2
+    # ===== (NEW) 서보 컨트롤러 초기화 & 1회 초기세팅 =====
+    ctl = DualServoController(args.port, args.baud) if HAS_SERVO else DualServoController()
+    try:
+        if args.center:
+            print(ctl.center())
+        if args.laser_on:
+            ctl.laser_on()
+        if args.laser_off:
+            ctl.laser_off()
+        if (args.pitch is not None) or (args.yaw is not None):
+            # ✅ 사용자가 CLI로 준 초기 각도 1회만 적용
+            print(ctl.set_angles(args.pitch, args.yaw))
         else:
-            yaw_cmd   = yaw_est   + YAW_OFFSET_DEG
-            pitch_cmd = pitch_est + PITCH_OFFSET_DEG
-
-        print(f"\n[FIRST TARGET] ID{first_target['hid']}: "
-              f"yaw_est={yaw_est:.2f}°, pitch_est={pitch_est:.2f}°  "
-              f"-> cmd=({yaw_cmd:.2f}°, {pitch_cmd:.2f}°)")
-
-        if SEND_SERIAL:
-            try:
-                import serial, time as _t
-                yaw_us   = deg_to_us(yaw_cmd,   SERVO['YAW_MIN_DEG'],   SERVO['YAW_MAX_DEG'],
-                                               SERVO['YAW_MIN_US'],    SERVO['YAW_MAX_US'])
-                pitch_us = deg_to_us(pitch_cmd, SERVO['PITCH_MIN_DEG'], SERVO['PITCH_MAX_DEG'],
-                                               SERVO['PITCH_MIN_US'],  SERVO['PITCH_MAX_US'])
-                ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-                _t.sleep(0.5)
-                ser.write(f"Y{yaw_us}\n".encode())
-                ser.write(f"P{pitch_us}\n".encode())
-                ser.close()
-                print(f"[Serial] Sent: Y={yaw_us}us, P={pitch_us}us")
-
-                # ---- (NEW) 순차 구동: 공통 ID들을 인덱스 순서대로 모두 조준 ----
-                if DRIVE_SEQUENCE_ON_START:
-                    try:
-                        ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-                        _t.sleep(0.5)
-                        # 현재 시작 각도는 방금 first_target으로 설정했다고 가정
-                        cur_yaw_deg   = float(yaw_cmd)
-                        cur_pitch_deg = float(pitch_cmd)
-                        order_ids = sorted(common_ids) if SEQ_ORDER_ASC else sorted(common_ids, reverse=True)
-                        for hid2 in order_ids:
-                            mr = by_id.get(hid2)
-                            if mr is None: 
-                                continue
-                            yaw_est2   = mr['yaw_deg']; pitch_est2 = mr['pitch_deg']
-                            if USE_LINEAR_CAL:
-                                yaw_cmd2   = A11*yaw_est2 + A12*pitch_est2 + B1
-                                pitch_cmd2 = A21*yaw_est2 + A22*pitch_est2 + B2
-                            else:
-                                yaw_cmd2   = yaw_est2   + YAW_OFFSET_DEG
-                                pitch_cmd2 = pitch_est2 + PITCH_OFFSET_DEG
-                            # 램핑 이동 또는 즉시 이동
-                            cur_yaw_deg, cur_pitch_deg = ramp_servo_to_deg(
-                                ser, cur_yaw_deg, cur_pitch_deg, yaw_cmd2, pitch_cmd2,
-                                step_deg=SEQ_STEP_DEG, step_delay=SEQ_STEP_DELAY_SEC
-                            )
-                            # 도달 후 dwell
-                            _t.sleep(max(0.0, float(SEQ_DWELL_SEC)))
-                        ser.close()
-                        print("[Serial] 순차 구동 완료.")
-                    except Exception as e:
-                        print(f"[Serial][ERR] 순차 구동 실패: {e}")
-            except Exception as e:
-                print(f"[Serial ERROR] {e}")
-    else:
-        print("[FIRST TARGET] 선택할 수 있는 타겟이 없습니다.")
-    # ====== ⬆️ 여기까지가 '자동 ID0 조준' 로직 ⬆️ ======
-
+            # 사용자가 초기각도 미지정이면, 첫 타깃(최소 ID) 각도로 1회 이동
+            if sorted_ids:
+                first = by_id[sorted_ids[0]]
+                yaw_cmd, pitch_cmd = apply_calibration(first["yaw_deg"], first["pitch_deg"])
+                send_servo_angles(ctl, yaw_cmd, pitch_cmd)
+    except Exception as e:
+        print(f"[Servo Init ERROR] {e}")
 
     # ==== MediaPipe Pose (왼쪽 카메라 전용) ====
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, model_complexity=1)
-    important_landmarks = {
-        "left_index": 15, "right_index": 16, "left_heel": 29,
-        "right_heel": 30, "left_foot_index": 31, "right_foot_index": 32,
-    }
-    hand_parts = {"left_index", "right_index"}
+    important_landmarks = {"left_index": 15, "right_index": 16}
+    hand_parts = set(important_landmarks.keys())
 
     # 터치 기록 상태
-    grip_records = []     # [part, hold_id, cx, cy]
-    already_grabbed = {}  # key=(name, hold_index) → True
-    touch_counters = {}   # key=(name, hold_index) → 연속 프레임 카운트
+    grip_records = []         # [part, hold_id, cx, cy]
+    already_grabbed = {}      # key=(name, hold_index) → True
+    touch_counters = {}       # key=(name, hold_index) → 연속 카운트
+
+    # (NEW) 자동 진행 상태
+    auto_advance_enabled = (not args.no_auto_advance)
+    current_target_id = sorted_ids[0] if sorted_ids else None
+    last_advanced_time = 0.0
+    ADV_COOLDOWN = 0.5  # 초과 트리거 방지(초)
 
     # 비디오 저장
     out = None
@@ -537,11 +436,10 @@ def main():
 
         # 화면 결합(표시만 스왑 옵션)
         vis = np.hstack([Rr, Lr]) if SWAP_DISPLAY else np.hstack([Lr, Rr])
-
         if SHOW_GRID:
             draw_grid(vis[:, :W]); draw_grid(vis[:, W:])
 
-        # 병합된 10프레임 결과(holdsL/holdsR)를 계속 그림
+        # 초기 10프레임 병합 결과를 라벨로 그림 (좌/우 둘 다)
         for side, holds in (("L", holdsL), ("R", holdsR)):
             xoff = xoff_for(side, W, SWAP_DISPLAY)
             for h in holds:
@@ -549,88 +447,112 @@ def main():
                 cv2.drawContours(vis, [cnt_shifted], -1, h["color"], 2)
                 cx, cy = h["center"]
                 cv2.circle(vis, (cx+xoff, cy), 4, (255,255,255), -1)
-                cv2.putText(vis, f"ID:{h['hold_index']}", (cx+xoff-10, cy+26),
+                tag = f"ID:{h['hold_index']}"
+                if (current_target_id is not None) and (h["hold_index"] == current_target_id):
+                    tag = "[TARGET] " + tag
+                cv2.putText(vis, tag, (cx+xoff-10, cy+26),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 3, cv2.LINE_AA)
-                cv2.putText(vis, f"ID:{h['hold_index']}", (cx+xoff-10, cy+26),
+                cv2.putText(vis, tag, (cx+xoff-10, cy+26),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, h["color"], 2, cv2.LINE_AA)
 
-        # 3D/각도 텍스트 + FIRST 표시
-        y0 = 30
-        for mr in matched_results:
-            X = mr["X"]
-            base = (f"ID{mr['hid']}  X=({X[0]:.1f},{X[1]:.1f},{X[2]:.1f})mm  "
-                    f"|X-L|={mr['d_left']:.1f}  d_line={mr['d_line']:.1f}  "
-                    f"yaw={mr['yaw_deg']:.1f}°  pitch={mr['pitch_deg']:.1f}°")
-            txt = "[FIRST] " + base if (first_target and mr["hid"] == first_target["hid"]) else base
-            cv2.putText(vis, txt, (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 3, cv2.LINE_AA)
-            cv2.putText(vis, txt, (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1, cv2.LINE_AA)
-            y0 += 22
+        # 타깃 각도 텍스트
+        y0 = 26
+        if current_target_id in by_id:
+            mr = by_id[current_target_id]
+            txt = (f"TARGET ID{mr['hid']}  "
+                   f"yaw={mr['yaw_deg']:.1f}°, pitch={mr['pitch_deg']:.1f}°")
+            cv2.putText(vis, txt, (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 3, cv2.LINE_AA)
+            cv2.putText(vis, txt, (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 1, cv2.LINE_AA)
+            y0 += 26
 
-        # 연속 인덱스 각도차(상위 5줄)
-        y1 = y0 + 8
-        for k in range(min(5, len(angle_deltas))):
-            i, j, dyaw, dpitch, d3d = angle_deltas[k]
-            t2 = f"Δ({i}->{j}): yaw={dyaw:+.1f}°, pitch={dpitch:+.1f}°, 3D={d3d:.1f}°"
-            cv2.putText(vis, t2, (20, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 3, cv2.LINE_AA)
-            cv2.putText(vis, t2, (20, y1), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,255,255), 1, cv2.LINE_AA)
-            y1 += 22
-
-        # MediaPipe Pose: 왼쪽만 (객체 재사용)
+        # MediaPipe Pose: 왼쪽만
         image_rgb = cv2.cvtColor(Lr, cv2.COLOR_BGR2RGB)
         result = pose.process(image_rgb)
-
         pose_landmarks = result.pose_landmarks
+
         if pose_landmarks:
             hL, wL = Lr.shape[:2]
             coords = {}
             for name, idx in important_landmarks.items():
                 lm = pose_landmarks.landmark[idx]
                 coords[name] = (lm.x * wL, lm.y * hL)
+
             left_xoff = xoff_for("L", W, SWAP_DISPLAY)
             for name, (x, y) in coords.items():
                 joint_color = (0, 0, 255) if name in hand_parts else (0, 255, 0)
-                cv2.circle(vis, (int(x)+left_xoff, int(y)), 5, joint_color, -1)
-                cv2.putText(vis, f"{name}: ({int(x)}, {int(y)})",
-                            (int(x)+left_xoff+5, int(y)-5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA)
-            for name, (x, y) in coords.items():
-                for i, hold in enumerate(holdsL):
+                cv2.circle(vis, (int(x)+left_xoff, int(y)), 6, joint_color, -1)
+                cv2.putText(vis, f"{name}:({int(x)},{int(y)})",
+                            (int(x)+left_xoff+6, int(y)-6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
+
+            # (NEW) 현재 타깃 홀드에 대한 '손가락 in polygon' 카운트 → 자동 진행
+            if auto_advance_enabled and (current_target_id in idxL):
+                hold = idxL[current_target_id]
+                for name, (x, y) in coords.items():
                     inside = cv2.pointPolygonTest(hold["contour"], (x, y), False) >= 0
-                    key = (name, i)
+                    key = (name, current_target_id)
                     if inside:
                         touch_counters[key] = touch_counters.get(key, 0) + 1
                         if touch_counters[key] >= TOUCH_THRESHOLD:
-                            cnt_shifted = hold["contour"] + np.array([[[left_xoff, 0]]], dtype=hold["contour"].dtype)
-                            cv2.drawContours(vis, [cnt_shifted], -1, hold["color"], thickness=cv2.FILLED)
-                            if not already_grabbed.get(key):
-                                cx, cy = hold["center"]
-                                grip_records.append([name, i, cx, cy])
-                                already_grabbed[key] = True
+                            now = time.time()
+                            if now - last_advanced_time > ADV_COOLDOWN:
+                                # 그립 기록 저장 (1회)
+                                if not already_grabbed.get(key):
+                                    cx, cy = hold["center"]
+                                    grip_records.append([name, current_target_id, cx, cy])
+                                    already_grabbed[key] = True
+
+                                # 다음 타깃으로 이동
+                                cur_idx = sorted_ids.index(current_target_id) if current_target_id in sorted_ids else -1
+                                if (cur_idx >= 0) and (cur_idx + 1 < len(sorted_ids)):
+                                    next_id = sorted_ids[cur_idx + 1]
+                                    current_target_id = next_id
+                                    nxt = by_id[next_id]
+                                    yaw_cmd, pitch_cmd = apply_calibration(nxt["yaw_deg"], nxt["pitch_deg"])
+                                    send_servo_angles(ctl, yaw_cmd, pitch_cmd)
+                                    print(f"[Auto-Advance] → ID{next_id}")
+                                    last_advanced_time = now
+                                else:
+                                    print("[Auto-Advance] 더 이상 다음 홀드가 없습니다.")
                     else:
                         touch_counters[key] = 0
 
-        # FPS & 출력
+        # FPS
         t_now = time.time(); fps = 1.0 / max(t_now - (t_prev), 1e-6); t_prev = t_now
-        cv2.putText(vis, f"FPS: {fps:.1f}  (YOLO first-10 merged; MP left, LEFT-origin)", (10, H-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-        cv2.putText(vis, f"FPS: {fps:.1f}  (YOLO first-10 merged; MP left, LEFT-origin)", (10, H-10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
+        cv2.putText(vis, f"FPS: {fps:.1f} (YOLO merged 10f; MP Left; Auto-Advance={'ON' if auto_advance_enabled else 'OFF'})",
+                    (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+        cv2.putText(vis, f"FPS: {fps:.1f} (YOLO merged 10f; MP Left; Auto-Advance={'ON' if auto_advance_enabled else 'OFF'})",
+                    (10, H-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 1, cv2.LINE_AA)
 
         imshow_scaled(WINDOW_NAME, vis, PREVIEW_MAX_W)
-        if SAVE_VIDEO:
-            out.write(vis)
+        if SAVE_VIDEO: out.write(vis)
 
         frame_idx += 1
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        k = cv2.waitKey(1) & 0xFF
+        if k == ord('q'):
             break
+        # 수동 스킵: 'n' → 다음 홀드로 강제 이동
+        elif k == ord('n') and sorted_ids:
+            if current_target_id in sorted_ids:
+                i = sorted_ids.index(current_target_id)
+                if i + 1 < len(sorted_ids):
+                    current_target_id = sorted_ids[i+1]
+                    nxt = by_id[current_target_id]
+                    yaw_cmd, pitch_cmd = apply_calibration(nxt["yaw_deg"], nxt["pitch_deg"])
+                    send_servo_angles(ctl, yaw_cmd, pitch_cmd)
+                    print(f"[Manual Next] → ID{current_target_id}")
 
     # 정리
     cap1.release(); cap2.release()
     if SAVE_VIDEO:
         out.release(); print(f"[Info] 저장 완료: {OUT_PATH}")
     cv2.destroyAllWindows()
+    try:
+        ctl.close()
+    except:
+        pass
 
-    # ✅ 그립 기록만 저장
+    # 그립 기록 저장
     with open(CSV_GRIPS_PATH, "w", newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(["part", "hold_id", "cx", "cy"])
