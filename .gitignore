@@ -206,16 +206,3 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
-=======
-/captures
-/__pycache__
-*.pyc
-*.pyo
-*.pyd
-*.swp
-*.swo
-.DS_Store
-env/
-venv/
-ENV/
->>>>>>> origin/main
