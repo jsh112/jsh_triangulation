@@ -40,9 +40,9 @@ def main():
         capL_idx, capR_idx = capR_idx, capL_idx  # 입력을 스왑하여 보정 좌/우와 일치
     cap1, cap2 = su.open_cams(capL_idx, capR_idx, size)
 
-    # 10프레임 저장
+    # 최초 두 프레임 버리고 INIT_DET_FRAMES 만큼 저장
     su.save_rectified_frames(cap1, cap2, map1x, map1y, map2x, map2y, size,
-                      INIT_DET_FRAMES, Path("rectified_frames/L"), Path("rectified_frames/R"))
+                      INIT_DET_FRAMES, Path("rectified_frames_L"), Path("rectified_frames_R"))
     
 
 

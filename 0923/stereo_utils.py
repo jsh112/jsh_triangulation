@@ -34,7 +34,7 @@ def open_cams(idx1, idx2, size):
     cap1.set(cv2.CAP_PROP_FRAME_WIDTH,  W); cap1.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
     cap2.set(cv2.CAP_PROP_FRAME_WIDTH,  W); cap2.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
     if not cap1.isOpened() or not cap2.isOpened():
-        raise SystemExit("카메라를 열 수 없습니다. 인덱스/연결 확인.")
+        raise SystemExit("Error In open_cams(), 카메라를 열 수 없습니다. 인덱스/연결 확인.")
     return cap1, cap2
 
 def rectify(frame, mx, my, size):
